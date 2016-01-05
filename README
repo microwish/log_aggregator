@@ -1,0 +1,42 @@
+============= "Bid/DSP" machine group ============
+
+log_aggregator0.conf: bid
+log_aggregator1.conf: unbid
+log_aggregator2.conf: unbid
+log_aggregator3.conf: pdb-bid pdb-unbid
+
+# crontab
+*/1 * * * * sh /data/users/data-infra/log-aggregator/log_aggregator.sh 4 >> /data/users/data-infra/log-aggregator/log_aggregator.sh.log 2>&1
+
+# CPU monitor
+nohup sh /data/users/data-infra/log-aggregator/cpu_monitor.sh 4 > /data/users/data-infra/log-aggregator/cpu_monitor.sh.log 2>&1 &
+
+
+=========== "Imp" machine group =============
+
+# size: imp > pdb-bid > pdb-unbid > unimp
+
+log_aggregator0.conf: pdb-bid pdb-unbid
+log_aggregator1.conf: imp unimp
+
+# crontab
+*/1 * * * * sh /data/users/data-infra/log-aggregator/log_aggregator.sh 2 >> /data/users/data-infra/log-aggregator/log_aggregator.sh.log 2>&1
+
+# CPU monitor
+nohup sh /data/users/data-infra/log-aggregator/cpu_monitor.sh 2 > /data/users/data-infra/log-aggregator/cpu_monitor.sh.log 2>&1 &
+
+
+======== "Stats" machine group ===========
+
+# size: ic > stats > imp > viewable > adv > pub > cvt > rc > vast
+
+log_aggregator0.conf: imp adv viewable
+log_aggregator1.conf: ic rc
+log_aggregator2.conf: ic vast
+log_aggregator3.conf: stats pub cvt
+
+# crontab
+*/1 * * * * sh /data/users/data-infra/log-aggregator/log_aggregator.sh 4 >> /data/users/data-infra/log-aggregator/log_aggregator.sh.log 2>&1
+
+# CPU monitor
+nohup sh /data/users/data-infra/log-aggregator/cpu_monitor.sh 4 > /data/users/data-infra/log-aggregator/cpu_monitor.sh.log 2>&1 &
