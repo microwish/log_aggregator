@@ -23,6 +23,7 @@
 #include <execinfo.h>
 
 #if 0
+// base name and offset of a file
 class FileOffset {
 public:
     std::string filename; // basename
@@ -137,7 +138,7 @@ static void parse_conf_file(const char *conf_path)
         return;
     }
 
-    char buf[128];
+    char buf[256];
 
     while (fgets(buf, sizeof(buf), fp) != NULL) {
         if (buf[0] == '\0') continue;
@@ -203,7 +204,7 @@ static inline bool dir_exists(const char *path)
 #define YMD_HOLDER "[Ymd]"
 #define YMD_HOLDER_LEN 5
 
-// /data/ef-logs/unbid/[Ymd]/{8}:
+// /data/ef-logs/unbid/[Ymd]/{8:0,1,2,3,4,5,6,7}:
 // /data/ef-logs/unbid/20150821/0/ /data/ef-logs/unbid/20150821/7/
 // /data/ef-logs/cvt/[Ymd]:
 // /data/ef-logs/cvt/20150822/
@@ -214,17 +215,46 @@ static void normalize(const std::string& topic, const std::string& path,
     result.push_back(LOG_PATH_ROOT + topic + '/');
 
     char temp[96];
-    const char *p = strrchr(path.c_str(), '{');
     int l = snprintf(temp, sizeof(temp), "%s%s/%s/",
                      LOG_PATH_ROOT, topic.c_str(), today_ymd.c_str());
 
     // for lately generated hashing subdirs
     result.push_back(temp);
 
+    const char *p = strrchr(path.c_str(), '{');
     if (p != NULL) {
-        for (int i = 0, n = atoi(p + 1); i < n; i++) {
-            sprintf(temp + l, "%d/", i);
-            result.push_back(temp);
+        int n = atoi(p + 1);
+        const char *p2 = strchr(p, ':');
+        if (p2 == NULL) {
+            for (int i = 0; i < n; i++) {
+                sprintf(temp + l, "%d/", i);
+                result.push_back(temp);
+            }
+        } else {
+            int m = -1;
+            const char *p3 = strchr(++p2, ',');
+            while (p3 != NULL) {
+                m = atoi(p2);
+                if (m < n) {
+                    sprintf(temp + l, "%d/", atoi(p2));
+                    result.push_back(temp);
+                } else {
+                    write_log(app_log_path, LOG_WARNING,
+                              "invalid hashing dir[%d:%d] for topic[%s]",
+                              n, m, topic.c_str());
+                }
+                p2 = p3 + 1;
+                p3 = strchr(p2, ',');
+            }
+            m = atoi(p2);
+            if (m < n) {
+                sprintf(temp + l, "%d/", m);
+                result.push_back(temp);
+            } else {
+                write_log(app_log_path, LOG_WARNING,
+                          "invalid hashing dir[%d:%d] for topic[%s]",
+                          n, m, topic.c_str());
+            }
         }
     }
 }
@@ -287,7 +317,7 @@ static int preprocess_inotify()
                 close(inot_fd);
                 return -1;
             }
-            write_log(app_log_path, LOG_WARNING, "inotify_add_watch[%s] failed"
+            write_log(app_log_path, LOG_INFO, "inotify_add_watch[%s] failed"
                       " with errno[%d]", it->second.c_str(), errno_sv);
         } else {
             wd_path_map[wd] = it->second;
@@ -334,6 +364,11 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
                                         char *fullpath,
                                         long offset = 0)
 {
+    if (kct == NULL) {
+        write_log(app_log_path, LOG_ERR, "null KCT");
+        return -1;
+    }
+
     const char *topic = get_topic(kct);
     if (topic == NULL) {
         write_log(app_log_path, LOG_ERR, "get_topic[%s] failed", fullpath);
@@ -376,7 +411,7 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
         }
         payloads.push_back(buf);
         if (++num % batch == 0) {
-            if (produce_messages(producer, kct, payloads, keys) < 0) {
+            if (produce_messages(producer, kct, payloads, keys) <= 0) {
                 write_log(app_log_path, LOG_ERR,
                           "produce_messages for topic[%s] failed", topic);
             } else {
@@ -411,8 +446,9 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
     }
 
     if (num % batch != 0) {
-        if (produce_messages(producer, kct, payloads, keys) < 0) {
-            write_log(app_log_path, LOG_ERR, "produce_messages failed");
+        if (produce_messages(producer, kct, payloads, keys) <= 0) {
+            write_log(app_log_path, LOG_ERR,
+                      "produce_messages for topic[%s] failed", topic);
         } else {
             fo.offset = ftell(fp);
             pthread_rwlock_rdlock(&offset_lock);
@@ -585,7 +621,7 @@ static int baz(int inot_fd)
                     if (wd == -1) {
                         int errno_sv = errno;
                         if (errno_sv == ENOENT) {
-                            write_log(app_log_path, LOG_WARNING,
+                            write_log(app_log_path, LOG_INFO,
                                       "inotify_add_watch[%s] failed"
                                       " with errno[%d] at midday",
                                       it->second.c_str(), errno_sv);
@@ -712,6 +748,15 @@ static void persist_offsets()
     std::map<std::string, FileOffset>::iterator it = path_offset_table.begin();
 
     while (it != path_offset_table.end()) {
+#if 0
+        // XXX
+        if (strncmp(it->first.c_str(), LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
+            write_log(app_log_path, LOG_WARNING, "invalid log file[%s/%s]",
+                      it->first.c_str(), it->second.filename);
+            it++;
+            continue;
+        }
+#endif
         snprintf(temp, sizeof(temp), "%s/%s:%ld\n", it->first.c_str(),
                  it->second.filename, it->second.offset);
         int n = fputs(temp, fp);
@@ -955,7 +1000,7 @@ static void *zero_update(void *arg)
                               "thread zero_update exiting");
                     return (void *)-1;
                 }
-                write_log(app_log_path, LOG_WARNING, "inotify_add_watch[%s]"
+                write_log(app_log_path, LOG_INFO, "inotify_add_watch[%s]"
                           " for zero update failed with errno[%d]",
                           it->second.c_str(), errno_sv);
             } else {
@@ -1022,6 +1067,16 @@ static void *remedy(void *arg)
     if (ret != 0) {
         write_log(app_log_path, LOG_ERR,
                   "pthread_detach[remedy] failed with errno[%d]", ret);
+        write_log(app_log_path, LOG_ERR,
+                  "thread remedy[%s] exiting prematurely", buf);
+        delete buf;
+        return (void *)-1;
+    }
+
+    // XXX
+    if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
+        write_log(app_log_path, LOG_WARNING,
+                  "invalid log file[%s] for remedy", buf);
         write_log(app_log_path, LOG_ERR,
                   "thread remedy[%s] exiting prematurely", buf);
         delete buf;
