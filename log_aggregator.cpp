@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <stddef.h>
 #include <errno.h>
 #include <syslog.h>
 #include <sys/inotify.h>
@@ -208,6 +210,8 @@ static inline bool dir_exists(const char *path)
 // /data/ef-logs/unbid/20150821/0/ /data/ef-logs/unbid/20150821/7/
 // /data/ef-logs/cvt/[Ymd]:
 // /data/ef-logs/cvt/20150822/
+//
+// all normalized paths end with a "/"
 static void normalize(const std::string& topic, const std::string& path,
                       std::vector<std::string>& result)
 {
@@ -273,6 +277,20 @@ static void normalize_paths()
                                                                     temp[i]));
         }
     }
+}
+
+static bool is_normal_path(const std::string& topic, const std::string& path)
+{
+    std::pair<std::multimap<std::string, std::string>::iterator,
+        std::multimap<std::string, std::string>::iterator> ret =
+            normal_paths.equal_range(topic);
+    for (std::multimap<std::string, std::string>::iterator it = ret.first;
+         it != ret.second; it++) {
+        if (it->second.compare(path) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static inline int set_nonblocking(int fd)
@@ -524,7 +542,10 @@ static void *foo(void *arg)
         for (n = 0; n < POP_NUM; n++) {
             paths[n].assign(conveyor.front());
             conveyor.pop_front();
-            if (conveyor.empty()) break;
+            if (conveyor.empty()) {
+                n++;
+                break;
+            }
         }
         if ((ret = pthread_mutex_unlock(&conveyor_mtx)) != 0) {
             write_log(app_log_path, LOG_WARNING,
@@ -580,9 +601,134 @@ static void *handle_conveyor_backlog(void *arg)
     return (void *)0;
 }
 
+#define SCAN_DIRENT_MAX 8
+
+static int scan_new_inotify_dir(const char *dir,
+                                std::vector<std::string>& missing,
+                                std::vector<unsigned char>& types)
+{
+    DIR *dp = opendir(dir);
+    if (dp == NULL) {
+        write_log(app_log_path, LOG_ERR,
+                  "opendir[%s] failed with errno[%d]",
+                  dir, errno);
+        return -1;
+    }
+
+    size_t el = offsetof(struct dirent, d_name) + 64;
+    struct dirent *dep = (struct dirent *)malloc(el);
+    if (dep == NULL) {
+        write_log(app_log_path, LOG_ERR, "malloc failed");
+        closedir(dp);
+        return -1;
+    }
+
+    int n = 0;
+    struct dirent *res;
+    while (readdir_r(dp, dep, &res) == 0) {
+        if (res == NULL || n == SCAN_DIRENT_MAX) {
+            write_log(app_log_path, LOG_INFO,
+                      "DEBUG %s leaving[%s] with entries[%d]",
+                      __FUNCTION__, dir, n);
+            free(dep);
+            closedir(dp);
+            return n;
+        }
+        if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
+            continue;
+        }
+        missing.push_back(dep->d_name);
+        types.push_back(dep->d_type);
+        n++;
+    }
+
+    write_log(app_log_path, LOG_ERR,
+              "readdir_r[%s] failed after entries[%d] with errno[%d]",
+              dir, n, errno);
+    free(dep);
+    closedir(dp);
+    return -1;
+}
+
+// dir ends with a "/"
+static int handle_new_inotify_dir(int inot_fd, const std::string& dir,
+                                  const std::string& topic)
+{
+    std::vector<std::string> missing;
+    std::vector<unsigned char> types;
+    int n = scan_new_inotify_dir(dir.c_str(), missing, types);
+    if (n < 0) {
+        return 0;
+    } else {
+        std::vector<std::string> subdirs;
+        int num = 0;
+        if (n == 0) {
+            write_log(app_log_path, LOG_INFO,
+                      "seems no missing inotify events for dir[%s]",
+                      dir.c_str());
+        } else {
+            write_log(app_log_path, LOG_INFO,
+                      "inotify missing files[%s:%d]", dir.c_str(), n);
+            std::string p;
+            for (int i = 0; i < n; i++) {
+                switch (types[i]) {
+                case DT_REG:
+                    p = dir + missing[i];
+                    conveyor.push_back(p);
+                    num++;
+                    write_log(app_log_path, LOG_INFO,
+                              "add missing file[%s]", p.c_str());
+                    break;
+                case DT_DIR:
+                    p = dir + missing[i] + "/";
+                    if (!is_normal_path(topic, p)) {
+                        write_log(app_log_path, LOG_INFO,
+                                  "DEBUG unexpected path[%s] from scan",
+                                  p.c_str());
+                        continue;
+                    }
+                    subdirs.push_back(p);
+                    break;
+                }
+            }
+        }
+        // do it here to avoid repeated enqueuing
+        int wd = inotify_add_watch(inot_fd, dir.c_str(),
+                                   IN_MOVED_TO | IN_CREATE | IN_DONT_FOLLOW);
+        if (wd == -1) {
+            int errno_sv = errno;
+            if (errno_sv == ENOENT) {
+                write_log(app_log_path, LOG_INFO,
+                          "inotify_add_watch[%s] failed"
+                          " with errno[%d] at midday",
+                          dir.c_str(), errno_sv);
+            } else {
+                write_log(app_log_path, LOG_ERR,
+                          "inotify_add_watch[%s] failed"
+                          " with errno[%d] at midday",
+                          dir.c_str(), errno_sv);
+            }
+        } else {
+            write_log(app_log_path, LOG_INFO,
+                      "path[%s] is newly watched at midday", dir.c_str());
+            wd_path_map[wd] = dir;
+            wd_topic_map[wd] = topic;
+        }
+
+        for (size_t i = 0, l = subdirs.size(); i < l; i++) {
+            num += handle_new_inotify_dir(inot_fd, subdirs[i], topic);
+        }
+
+        return num;
+    }
+}
+
+#define INOT_BUF_LEN 8192
+
 static int baz(int inot_fd)
 {
-    char buf[8192] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    char buf[INOT_BUF_LEN]
+        __attribute__ ((aligned(__alignof__(struct inotify_event))));
     struct inotify_event *evp;
     int num = 0;
 
@@ -601,59 +747,46 @@ static int baz(int inot_fd)
         } else if (n == 0) {
             write_log(app_log_path, LOG_INFO, "no inotify events read");
             break;
+        } else if (n == INOT_BUF_LEN) {
+            write_log(app_log_path, LOG_WARNING, "inotify buf might overflow");
         }
+
+        std::string path;
 
         for (char *p = buf; p < buf + n;
              p += sizeof(struct inotify_event) + evp->len) {
             evp = (struct inotify_event *)p;
-            if ((evp->mask & (IN_ISDIR | IN_CREATE)) != 0) {
-                pthread_rwlock_rdlock(&watch_lock);
-                std::multimap<std::string, std::string>::const_iterator it =
-                    normal_paths.begin();
-                for (; it != normal_paths.end(); it++) {
-                    std::string& parent = wd_path_map[evp->wd];
-                    if (strncmp(parent.c_str(), it->second.c_str(),
-                                parent.length()) != 0) {
-                        continue;
+            if ((evp->mask & IN_ISDIR) != 0) {
+                if ((evp->mask & IN_CREATE) != 0) {
+                    pthread_rwlock_rdlock(&watch_lock);
+                    std::string& topic = wd_topic_map[evp->wd];
+                    path.assign(wd_path_map[evp->wd]);
+                    path.append(evp->name);
+                    path.append("/");
+                    if (is_normal_path(topic, path)) {
+                        num += handle_new_inotify_dir(inot_fd, path, topic);
+                    } else {
+                        write_log(app_log_path, LOG_INFO,
+                                  "DEBUG unexpected path[%s] from inotify",
+                                  path.c_str());
                     }
-                    int wd = inotify_add_watch(inot_fd, it->second.c_str(),
-                                      IN_MOVED_TO | IN_CREATE | IN_DONT_FOLLOW);
-                    if (wd == -1) {
-                        int errno_sv = errno;
-                        if (errno_sv == ENOENT) {
-                            write_log(app_log_path, LOG_INFO,
-                                      "inotify_add_watch[%s] failed"
-                                      " with errno[%d] at midday",
-                                      it->second.c_str(), errno_sv);
-                        } else {
-                            write_log(app_log_path, LOG_ERR,
-                                      "inotify_add_watch[%s] failed"
-                                      " with errno[%d] at midday",
-                                      it->second.c_str(), errno_sv);
-                        }
-                        continue;
-                    }
-                    wd_path_map[wd] = it->second;
-                    wd_topic_map[wd] = wd_topic_map[evp->wd];
-                    write_log(app_log_path, LOG_INFO,
-                              "path[%s] might be newly watched at midday",
-                              it->second.c_str());
-                }
-                pthread_rwlock_unlock(&watch_lock);
-            } else if ((evp->mask & IN_MOVED_TO) != 0) {
-                pthread_rwlock_rdlock(&watch_lock);
-                std::string path(wd_path_map[evp->wd]);
-                pthread_rwlock_unlock(&watch_lock);
-
-                path.append(evp->name);
-                conveyor.push_back(path);
-                num++;
-            } else {
-                if (evp->mask != IN_IGNORED) {
+                    pthread_rwlock_unlock(&watch_lock);
+                } else {
                     write_log(app_log_path, LOG_WARNING,
-                              "unexpected inotify event mask[%u]", evp->mask);
+                              "unexpected inotify dir event[%u]", evp->mask);
                 }
-                continue;
+            } else {
+                if ((evp->mask & IN_MOVED_TO) != 0) {
+                    pthread_rwlock_rdlock(&watch_lock);
+                    path.assign(wd_path_map[evp->wd]);
+                    pthread_rwlock_unlock(&watch_lock);
+
+                    path.append(evp->name);
+                    conveyor.push_back(path);
+                    num++;
+                } else {
+                    // TODO
+                }
             }
         }
     } while (true);
@@ -685,7 +818,12 @@ static void *bar(void *arg)
         } else if (n == 0) {
             write_log(app_log_path, LOG_WARNING,
                       "poll timed out after 120 seconds");
-            sleep(60);
+            continue;
+        }
+
+        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            write_log(app_log_path, LOG_WARNING, "poll abnormal");
+            continue;
         }
 
         int i;
@@ -1038,7 +1176,7 @@ static void *routine_update(void *arg)
     do {
         sleep(4027); // 1 hour + 7 minute + 7 second
 
-        //04:00:00
+        // every four hours
         if (time(NULL) - zero_ts < 14400) continue;
 
         // step 1: update wd_path_map & wd_topic_map
