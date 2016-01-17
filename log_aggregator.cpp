@@ -1096,16 +1096,27 @@ static void *zero_update(void *arg)
 
     do {
         // XXX
-        sleep(70);
+        sleep(15);
 
         time_t ts = time(NULL);
         std::string ymd = ymd_stringify(ts);
-        if (ymd == today_ymd) continue;
+        if (ymd == today_ymd) {
+            time_t diff = zero_ts + 86400 - ts;
+            if (diff < 15) {
+                sleep(diff + 1);
+                ts += diff + 1;
+                ymd = ymd_stringify(ts);
+                zero_ts += 86400;
+            } else {
+                continue;
+            }
+        } else {
+            get_zero_ts(ts);
+        }
 
         // step 1: update date ymd
         yesterday_ymd = today_ymd;
         today_ymd = ymd;
-        get_zero_ts(ts);
 
         write_log(app_log_path, LOG_INFO, "updating some global data with"
                   " yesterday[%s] & today[%s]",
