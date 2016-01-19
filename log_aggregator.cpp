@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <execinfo.h>
+#include <sys/select.h>
 
 #if 0
 // base name and offset of a file
@@ -409,7 +410,7 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
     }
 
     int num = 0, batch = BATCH_NUM;
-    char buf[8192], *p = strrchr(fullpath, '/');
+    char buf[10240], *p = strrchr(fullpath, '/');
     std::vector<std::string> payloads, keys;
     FileOffset fo;
 
@@ -564,6 +565,17 @@ static void *foo(void *arg)
     return (void *)0;
 }
 
+static void delay_simply(int milli)
+{
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = milli * 1000;
+    if (select(0, NULL, NULL, NULL, &tv) == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "select failed with errno[%d]", errno);
+    }
+}
+
 static void *handle_conveyor_backlog(void *arg)
 {
     write_log(app_log_path, LOG_INFO, "thread handle_conveyor_backlog created");
@@ -623,16 +635,24 @@ static int scan_new_inotify_dir(const char *dir,
         return -1;
     }
 
-    int n = 0;
+    int n = 0, count = 0;
     struct dirent *res;
     while (readdir_r(dp, dep, &res) == 0) {
         if (res == NULL || n == SCAN_DIRENT_MAX) {
-            write_log(app_log_path, LOG_INFO,
-                      "DEBUG %s leaving[%s] with entries[%d]",
-                      __FUNCTION__, dir, n);
-            free(dep);
-            closedir(dp);
-            return n;
+            ++count;
+            if (n == 0 && count < 2) {
+                // XXX once again to avoid losing entries
+                delay_simply(200);
+                rewinddir(dp);
+                continue;
+            } else {
+                write_log(app_log_path, LOG_INFO,
+                          "DEBUG %s leaving[%s] with entries[%d]",
+                          __FUNCTION__, dir, n);
+                free(dep);
+                closedir(dp);
+                return n;
+            }
         }
         if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
             continue;
