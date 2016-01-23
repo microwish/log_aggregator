@@ -410,7 +410,7 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
     }
 
     int num = 0, batch = BATCH_NUM;
-    char buf[10240], *p = strrchr(fullpath, '/');
+    char buf[65536], *p = strrchr(fullpath, '/');
     std::vector<std::string> payloads, keys;
     FileOffset fo;
 
@@ -424,8 +424,8 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
         if (p2 != NULL) *p2 = '\0';
         if (buf[0] == '\0') {
             write_log(app_log_path, LOG_WARNING,
-                      "empty log line in dir[%s] file[%s]",
-                      fullpath, fo.filename);
+                      "empty log line in dir[%s] file[%s] line[%d]",
+                      fullpath, fo.filename, num);
             continue;
         }
         payloads.push_back(buf);
@@ -640,9 +640,12 @@ static int scan_new_inotify_dir(const char *dir,
     while (readdir_r(dp, dep, &res) == 0) {
         if (res == NULL || n == SCAN_DIRENT_MAX) {
             ++count;
-            if (n == 0 && count < 2) {
+            if (count < 2 && n < SCAN_DIRENT_MAX) {
                 // XXX once again to avoid losing entries
-                delay_simply(200);
+                n = 0;
+                missing.clear();
+                types.clear();
+                delay_simply(800);
                 rewinddir(dp);
                 continue;
             } else {
