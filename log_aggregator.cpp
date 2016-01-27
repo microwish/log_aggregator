@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <deque>
+#include <set>
 #include <stdio.h>
 #include <stdlib.h>
 #ifndef _GNU_SOURCE
@@ -96,10 +97,16 @@ public:
 
 #define CWD_ROOT "/data/users/data-infra/log-aggregator"
 
+static std::set<std::string> literal_topics;
+
 // map of topic <--> raw path
 static std::map<std::string, std::string> raw_paths;
 // map of topic <--> normal path
 static std::multimap<std::string, std::string> normal_paths;
+
+static std::multimap<std::string, std::string> direct_files;
+static std::map<std::string, FILE *> direct_fps;
+static std::map<std::string, std::vector<std::string> > direct_payloads;
 
 static std::string today_ymd, yesterday_ymd;
 static time_t zero_ts;
@@ -126,6 +133,21 @@ static std::map<std::string, kafka_client_topic_t *> topics;
 
 static char *app_log_path = NULL;
 
+static int is_direct_path(const char *path)
+{
+    if (strchr(path, '[') == NULL && strchr(path, '{') == NULL) {
+        struct stat stbuf;
+        if (stat(path, &stbuf) != 0) {
+            write_log(app_log_path, LOG_ERR,
+                      "stat[%s] failed with errno[%d]", path, errno);
+            return -1;
+        }
+        if (S_ISREG(stbuf.st_mode)) return 1;
+        if (S_ISDIR(stbuf.st_mode)) return 2;
+    }
+    return 0;
+}
+
 // retrieve the configured directories to be monitored
 static void parse_conf_file(const char *conf_path)
 {
@@ -142,6 +164,7 @@ static void parse_conf_file(const char *conf_path)
     }
 
     char buf[256];
+    std::string topic;
 
     while (fgets(buf, sizeof(buf), fp) != NULL) {
         if (buf[0] == '\0') continue;
@@ -164,12 +187,31 @@ static void parse_conf_file(const char *conf_path)
             continue;
         }
         *q = '\0';
-        raw_paths[p] = q + 1;
+        topic.assign(p);
+        literal_topics.insert(topic);
+
+        switch (is_direct_path(q + 1)) {
+        case 0:
+            raw_paths[topic] = q + 1;
+            break;
+        case 1:
+            direct_files.insert(std::pair<std::string, std::string>(topic,
+                                                                    q + 1));
+            break;
+        case 2:
+            normal_paths.insert(std::pair<std::string, std::string>(topic,
+                                                                    q + 1));
+            break;
+        default:
+            continue;
+        }
     }
 
     if (ferror(fp) != 0) {
         write_log(app_log_path, LOG_ERR, "fgets[%s] failed", conf_path);
         raw_paths.clear();
+        direct_files.clear();
+        normal_paths.clear();
     }
 
     fclose(fp);
@@ -265,7 +307,7 @@ static void normalize(const std::string& topic, const std::string& path,
 }
 
 // put all directories for today in the map
-// regardless of whether a dir exists now
+// regardless of whether a dir exists in local filesystem now
 static void normalize_paths()
 {
     std::vector<std::string> temp;
@@ -344,7 +386,7 @@ static int preprocess_inotify()
         }
     }
 
-    if (wd_path_map.size() == 0) {
+    if (wd_path_map.size() == 0 && normal_paths.size() != 0) {
         close(inot_fd);
         return -1;
     }
@@ -356,24 +398,45 @@ static void destroy_topics()
 {
     for (std::map<std::string, kafka_client_topic_t *>::iterator it =
          topics.begin(); it != topics.end(); it++) {
-        del_topic(it->second);
+        if (it->second != NULL) del_topic(it->second);
     }
     topics.clear();
 }
 
 static bool init_topics()
 {
-    for (std::map<std::string, std::string>::const_iterator it =
-         raw_paths.begin(); it != raw_paths.end(); it++) {
-        kafka_client_topic_t *kct = set_producer_topic(producer,
-                                                       it->first.c_str());
+    for (std::set<std::string>::const_iterator it = literal_topics.begin();
+         it != literal_topics.end(); it++) {
+        kafka_client_topic_t *kct = set_producer_topic(producer, it->c_str());
         if (kct == NULL) {
             destroy_topics();
             return false;
         }
-        topics[it->first] = kct;
+        topics[*it] = kct;
     }
     return true;
+}
+
+static void init_direct_payloads()
+{
+    for (std::multimap<std::string, std::string>::const_iterator it =
+         direct_files.begin(); it != direct_files.end(); ++it) {
+        if (direct_payloads.find(it->first) == direct_payloads.end()) {
+            direct_payloads[it->first] = std::vector<std::string>();
+        }
+    }
+}
+
+static void clear_direct_fp_cache()
+{
+    for (std::map<std::string, FILE *>::iterator it = direct_fps.begin();
+         it != direct_fps.end(); it++) {
+        if (it->second != NULL) {
+            fclose(it->second);
+            it->second = NULL;
+        }
+    }
+    direct_fps.clear();
 }
 
 #define BATCH_NUM 100
@@ -492,6 +555,7 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
     return num;
 }
 
+// XXX
 static bool extract_topic_from_path(const std::string& path, std::string& topic)
 {
     if (path.length() <= LOG_PATH_ROOT_LEN) {
@@ -574,6 +638,102 @@ static void delay_simply(int milli)
         write_log(app_log_path, LOG_ERR,
                   "select failed with errno[%d]", errno);
     }
+}
+
+#define DIRECT_BATCH 100
+
+static void *produce_directly(void *arg)
+{
+    write_log(app_log_path, LOG_INFO, "thread produce_directly created");
+
+    int ret = pthread_detach(pthread_self());
+    if (ret != 0) {
+        write_log(app_log_path, LOG_ERR,
+                  "pthread_detach[produce_directly] failed with errno[%d]",
+                  ret);
+        write_log(app_log_path, LOG_ERR, "thread produce_directly exiting");
+        return (void *)-1;
+    }
+
+    std::multimap<std::string, std::string>::iterator it = direct_files.begin();
+    char buf[16384];
+    std::map<std::string, FILE *>::iterator it2;
+    std::vector<std::string> keys;
+    FileOffset fo;
+    std::map<std::string, FileOffset>::iterator it3;
+
+    do {
+        std::string& topic = const_cast<std::string&>(it->first);
+        char *fullpath = const_cast<char *>(it->second.c_str());
+        FILE *fp;
+        if ((it2 = direct_fps.find(it->second)) == direct_fps.end()) {
+            if ((fp = fopen(fullpath, "r")) == NULL) {
+                write_log(app_log_path, LOG_ERR,
+                          "fopen[%s] failed with errno[%d]", errno);
+                if (++it == direct_files.end()) it = direct_files.begin();
+                continue;
+            } else {
+                direct_fps[it->second] = fp;
+            }
+        } else {
+            fp = it2->second;
+        }
+
+        int num = 0;
+        std::vector<std::string>& payloads = direct_payloads[topic];
+        while (fgets(buf, sizeof(buf), fp) != NULL && num < DIRECT_BATCH) {
+            char *p = strrchr(buf, '\n');
+            if (p != NULL) *p = '\0';
+            if (buf[0] == '\0') {
+                write_log(app_log_path, LOG_WARNING,
+                          "empty log line in file[%s] around line[%d]",
+                          fullpath, num);
+                continue;
+            }
+            payloads.push_back(buf);
+            ++num;
+        }
+        write_log(app_log_path, LOG_INFO,
+                  "file[%s] read lines[%lu]", fullpath, num);
+        if (payloads.size() < DIRECT_BATCH) {
+            if (++it == direct_files.end()) it = direct_files.begin();
+            // TODO should be configurable
+            delay_simply(60000 * 5);
+            continue;
+        }
+
+        if (produce_messages(producer, topics[topic], payloads, keys) <= 0) {
+            write_log(app_log_path, LOG_ERR,
+                      "produce_messages for topic[%s][%lu] failed",
+                      topic.c_str(), payloads.size());
+        } else {
+            char *p = strrchr(fullpath, '/');
+            strcpy(fo.filename, p + 1);
+            fo.offset = ftell(fp);
+            *p = '\0';
+
+            pthread_rwlock_rdlock(&offset_lock);
+            if ((it3 = path_offset_table.find(fullpath))
+                == path_offset_table.end()) {
+                pthread_rwlock_unlock(&offset_lock);
+                pthread_rwlock_wrlock(&offset_lock);
+                path_offset_table[fullpath] = fo;
+            } else {
+                it3->second = fo;
+            }
+            pthread_rwlock_unlock(&offset_lock);
+
+            *p = '/';
+            write_log(app_log_path, LOG_INFO,
+                      "topic sent [%s][%d]",
+                      topic.c_str(), payloads.size());
+            payloads.clear();
+        }
+
+        if (++it == direct_files.end()) it = direct_files.begin();
+    } while (true);
+
+    return (void *)0;
 }
 
 static void *handle_conveyor_backlog(void *arg)
@@ -821,7 +981,15 @@ static void *bar(void *arg)
 {
     write_log(app_log_path, LOG_INFO, "thread bar created");
 
-    int inot_fd = (int)(intptr_t)arg, n, ret;
+    int ret = pthread_detach(pthread_self());
+    if (ret != 0) {
+        write_log(app_log_path, LOG_ERR,
+                  "pthread_detach[bar] failed with errno[%d]", ret);
+        write_log(app_log_path, LOG_ERR, "thread bar exiting");
+        return (void *)-1;
+    }
+
+    int inot_fd = (int)(intptr_t)arg, n;
     struct pollfd pfd = { inot_fd, POLLIN | POLLPRI, 0 };
 
     do {
@@ -937,6 +1105,7 @@ static void *archive_offsets(void *arg)
 {
     write_log(app_log_path, LOG_INFO, "thread archive_offsets created");
 
+#if 0
     int ret = pthread_detach(pthread_self());
     if (ret != 0) {
         write_log(app_log_path, LOG_ERR, "pthread_detach[archive_offsets]"
@@ -944,6 +1113,7 @@ static void *archive_offsets(void *arg)
         write_log(app_log_path, LOG_ERR, "thread archive_offsets exiting");
         return (void *)-1;
     }
+#endif
 
     do {
         sleep(60);
@@ -1062,8 +1232,6 @@ static void clear_up_offset_table()
     for (std::map<std::string, FileOffset>::iterator it =
          path_offset_table.begin(); it != path_offset_table.end(); it++) {
         if (it->first.find(today_ymd) != std::string::npos) continue;
-
-        if (!extract_topic_from_path(it->first, topic)) continue;
 
         if ((ret = pthread_mutex_lock(&conveyor_mtx)) != 0) {
             write_log(app_log_path, LOG_WARNING,
@@ -1246,11 +1414,12 @@ static void *remedy(void *arg)
     }
 
     // XXX
-    if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
+    // if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
+    if (strncmp(buf, "/data/", sizeof("/data/") - 1) != 0) {
         write_log(app_log_path, LOG_WARNING,
                   "invalid log file[%s] for remedy", buf);
         write_log(app_log_path, LOG_ERR,
-                  "thread remedy[%s] exiting prematurely", buf);
+                  "thread remedy[%s] exiting prematurely 2", buf);
         delete buf;
         return (void *)-1;
     }
@@ -1259,7 +1428,7 @@ static void *remedy(void *arg)
         write_log(app_log_path, LOG_ERR,
                   "invalid offset record[%s] for remedy", buf);
         write_log(app_log_path, LOG_ERR,
-                  "thread remedy[%s] exiting prematurely", buf);
+                  "thread remedy[%s] exiting prematurely 3", buf);
         delete buf;
         return (void *)-1;
     }
@@ -1269,10 +1438,16 @@ static void *remedy(void *arg)
     char topic[32];
     size_t l;
 
-    p = strchr(buf + LOG_PATH_ROOT_LEN, '/');
-    l = p - (buf + LOG_PATH_ROOT_LEN);
-    memcpy(topic, buf + LOG_PATH_ROOT_LEN, l);
-    topic[l] = '\0';
+    // TODO contents of offset files
+    if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) == 0) {
+        p = strchr(buf + LOG_PATH_ROOT_LEN, '/');
+        l = p - (buf + LOG_PATH_ROOT_LEN);
+        memcpy(topic, buf + LOG_PATH_ROOT_LEN, l);
+        topic[l] = '\0';
+    } else {
+        // XXX temporary treatment
+        memcpy(topic, "consolevisit", sizeof("consolevisit"));
+    }
 
     int num = produce_msgs_and_save_offset(topics[topic], buf, offset);
 
@@ -1390,7 +1565,8 @@ int main(int argc, char *argv[])
     } while (opt != -1);
 
     parse_conf_file(conf_path);
-    if (raw_paths.size() == 0) {
+    if (raw_paths.size() == 0 && direct_files.size() == 0
+        && normal_paths.size() == 0) {
         fprintf(stderr, "retrieval of configured paths failed\n");
         exit(EXIT_FAILURE);
     }
@@ -1408,7 +1584,7 @@ for (std::map<std::string, std::string>::iterator it = raw_paths.begin();
     get_zero_ts(ts);
 
     normalize_paths();
-    if (normal_paths.size() == 0) {
+    if (normal_paths.size() == 0 && raw_paths.size() != 0) {
         write_log(app_log_path, LOG_ERR, "normalize_paths failed");
         exit(EXIT_FAILURE);
     }
@@ -1418,7 +1594,14 @@ for (std::multimap<std::string, std::string>::iterator it =
     fprintf(stderr, "topic[%s] normal path[%s]\n",
             it->first.c_str(), it->second.c_str());
 }
+for (std::multimap<std::string, std::string>::iterator it =
+     direct_files.begin(); it != direct_files.end(); it++) {
+    fprintf(stderr, "topic[%s] direct file[%s]\n",
+            it->first.c_str(), it->second.c_str());
+}
 #endif
+
+    init_direct_payloads();
 
     if ((producer = create_kafka_producer(producer_conf, brokers)) == NULL) {
         write_log(app_log_path, LOG_ERR, "create_kafka_producer to brokers[%s]"
@@ -1453,27 +1636,43 @@ for (std::map<int, std::string>::iterator it = wd_path_map.begin();
 
     set_sig_handlers();
 
-    pthread_t thr2;
-    int ret = pthread_create(&thr2, NULL, bar, (void *)(intptr_t)inot_fd);
-    if (ret != 0) {
-        write_log(app_log_path, LOG_ERR, "pthread_create[bar] failed"
-                  " with errno[%d]", ret);
-        destroy_topics();
-        destroy_kafka_producer(producer);
-        close(inot_fd);
-        exit(EXIT_FAILURE);
+    if (wd_path_map.size() > 0) {
+        pthread_t thr2;
+        int ret = pthread_create(&thr2, NULL, bar, (void *)(intptr_t)inot_fd);
+        if (ret != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_create[bar] failed"
+                      " with errno[%d]", ret);
+            destroy_topics();
+            destroy_kafka_producer(producer);
+            close(inot_fd);
+            exit(EXIT_FAILURE);
+        }
+
+        sleep(60);
+
+        pthread_t thr;
+        if ((ret = pthread_create(&thr, NULL, foo, NULL)) != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_create[foo] failed"
+                      " with errno[%d]", ret);
+            destroy_topics();
+            destroy_kafka_producer(producer);
+            close(inot_fd);
+            exit(EXIT_FAILURE);
+        }
     }
 
-    sleep(60);
+    int ret;
 
-    pthread_t thr;
-    if ((ret = pthread_create(&thr, NULL, foo, NULL)) != 0) {
-        write_log(app_log_path, LOG_ERR, "pthread_create[foo] failed"
-                  " with errno[%d]", ret);
-        destroy_topics();
-        destroy_kafka_producer(producer);
-        close(inot_fd);
-        exit(EXIT_FAILURE);
+    if (direct_files.size() > 0) {
+        pthread_t thr7;
+        if ((ret = pthread_create(&thr7, NULL, produce_directly, NULL)) != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_create[produce_directly]"
+                      " failed with errno[%d]", ret);
+            destroy_topics();
+            destroy_kafka_producer(producer);
+            close(inot_fd);
+            exit(EXIT_FAILURE);
+        }
     }
 
     pthread_t thr3;
@@ -1484,6 +1683,7 @@ for (std::map<int, std::string>::iterator it = wd_path_map.begin();
         destroy_topics();
         destroy_kafka_producer(producer);
         close(inot_fd);
+        clear_direct_fp_cache();
         exit(EXIT_FAILURE);
     }
 
@@ -1496,6 +1696,7 @@ for (std::map<int, std::string>::iterator it = wd_path_map.begin();
         destroy_topics();
         destroy_kafka_producer(producer);
         close(inot_fd);
+        clear_direct_fp_cache();
         exit(EXIT_FAILURE);
     }
 
@@ -1508,6 +1709,7 @@ for (std::map<int, std::string>::iterator it = wd_path_map.begin();
         destroy_topics();
         destroy_kafka_producer(producer);
         close(inot_fd);
+        clear_direct_fp_cache();
         exit(EXIT_FAILURE);
     }
 
@@ -1520,17 +1722,19 @@ for (std::map<int, std::string>::iterator it = wd_path_map.begin();
         destroy_topics();
         destroy_kafka_producer(producer);
         close(inot_fd);
+        clear_direct_fp_cache();
         exit(EXIT_FAILURE);
     }
 
-    if ((ret = pthread_join(thr2, NULL)) != 0) {
-        write_log(app_log_path, LOG_ERR, "pthread_join[bar] failed"
-                  " with errno[%d]", ret);
+    if ((ret = pthread_join(thr3, NULL)) != 0) {
+        write_log(app_log_path, LOG_ERR, "pthread_join[archive_offsets]"
+                  " failed with errno[%d]", ret);
     }
 
     destroy_topics();
     destroy_kafka_producer(producer);
     close(inot_fd);
+    clear_direct_fp_cache();
 
     write_log(app_log_path, LOG_WARNING, "unexpected exiting");
 
