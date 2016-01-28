@@ -95,6 +95,30 @@ public:
 };
 #endif
 
+struct RemedyArg {
+    char topic[32];
+    char fullpath[256];
+    long offset;
+    RemedyArg(): offset(0) {}
+    RemedyArg(long offset): offset(offset) {}
+    RemedyArg(const RemedyArg& ra)
+    {
+        strcpy(topic, ra.topic);
+        strcpy(fullpath, ra.fullpath);
+        offset = ra.offset;
+    }
+    ~RemedyArg() {}
+    RemedyArg& operator=(const RemedyArg& rhs)
+    {
+        if (this != &rhs) {
+            strcpy(topic, rhs.topic);
+            strcpy(fullpath, rhs.fullpath);
+            offset = rhs.offset;
+        }
+        return *this;
+    }
+};
+
 #define CWD_ROOT "/data/users/data-infra/log-aggregator"
 
 static std::set<std::string> literal_topics;
@@ -104,7 +128,9 @@ static std::map<std::string, std::string> raw_paths;
 // map of topic <--> normal path
 static std::multimap<std::string, std::string> normal_paths;
 
+// topic <--> full path of "direct" files
 static std::multimap<std::string, std::string> direct_files;
+// full path of "direct" files <--> file pointer
 static std::map<std::string, FILE *> direct_fps;
 static std::map<std::string, std::vector<std::string> > direct_payloads;
 
@@ -439,6 +465,24 @@ static void clear_direct_fp_cache()
     direct_fps.clear();
 }
 
+static bool init_direct_fp_cache()
+{
+    for (std::multimap<std::string, std::string>::const_iterator it =
+         direct_files.begin(); it != direct_files.end(); ++it) {
+        FILE *fp = fopen(it->second.c_str(), "r");
+        if (fp == NULL) {
+            write_log(app_log_path, LOG_ERR,
+                      "fopen[%s] failed with errno[%d]",
+                      it->second.c_str(), errno);
+            clear_direct_fp_cache();
+            return false;
+        } else {
+            direct_fps[it->second] = fp;
+        }
+    }
+    return true;
+}
+
 #define BATCH_NUM 100
 #define BATCH_NUM_UNBID 300
 
@@ -640,6 +684,32 @@ static void delay_simply(int milli)
     }
 }
 
+static bool get_path_from_fp(FILE *fp, char *path, size_t pathlen)
+{
+    if (fp == NULL) {
+        write_log(app_log_path, LOG_ERR, "Null FP for path");
+        return false;
+    }
+    int fd = fileno(fp);
+    if (fd == -1) {
+        write_log(app_log_path, LOG_ERR, "fileno failed with errno[%d]", errno);
+        return false;
+    }
+
+    char proclnk[256];
+    snprintf(proclnk, sizeof(proclnk), "/proc/self/fd/%d", fd);
+
+    ssize_t n = readlink(proclnk, path, pathlen);
+    if (n == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "readlink[%s] failed with errno[%d]", proclnk, errno);
+        return false;
+    }
+    path[n] = '\0';
+
+    return true;
+}
+
 #define DIRECT_BATCH 100
 
 static void *produce_directly(void *arg)
@@ -656,7 +726,7 @@ static void *produce_directly(void *arg)
     }
 
     std::multimap<std::string, std::string>::iterator it = direct_files.begin();
-    char buf[16384];
+    char buf[16384], temp_path[256];
     std::map<std::string, FILE *>::iterator it2;
     std::vector<std::string> keys;
     FileOffset fo;
@@ -666,13 +736,16 @@ static void *produce_directly(void *arg)
         std::string& topic = const_cast<std::string&>(it->first);
         char *fullpath = const_cast<char *>(it->second.c_str());
         FILE *fp;
-        if ((it2 = direct_fps.find(it->second)) == direct_fps.end()) {
+        if ((it2 = direct_fps.find(it->second)) == direct_fps.end()
+            || it2->second == NULL) {
             if ((fp = fopen(fullpath, "r")) == NULL) {
                 write_log(app_log_path, LOG_ERR,
-                          "fopen[%s] failed with errno[%d]", errno);
+                          "fopen[%s] failed with errno[%d]", fullpath, errno);
                 if (++it == direct_files.end()) it = direct_files.begin();
                 continue;
             } else {
+                write_log(app_log_path, LOG_WARNING,
+                          "direct file[%s] re-opened", fullpath);
                 direct_fps[it->second] = fp;
             }
         } else {
@@ -695,11 +768,24 @@ static void *produce_directly(void *arg)
         }
         write_log(app_log_path, LOG_INFO,
                   "file[%s] read lines[%lu]", fullpath, num);
+
         if (payloads.size() < DIRECT_BATCH) {
-            if (++it == direct_files.end()) it = direct_files.begin();
-            // TODO should be configurable
-            delay_simply(60000 * 5);
-            continue;
+            // check whether log file was rolled
+            if (get_path_from_fp(fp, temp_path, sizeof(temp_path) - 1)
+                && strcmp(fullpath, temp_path) != 0) {
+                fclose(fp);
+                if ((fp = fopen(fullpath, "r")) == NULL) {
+                    write_log(app_log_path, LOG_ERR,
+                              "fopen[%s] rolled failed with errno[%d]",
+                              fullpath, errno);
+                }
+                it2->second = fp;
+            } else {
+                if (++it == direct_files.end()) it = direct_files.begin();
+                // TODO should be configurable
+                delay_simply(60000 * 5);
+                continue;
+            }
         }
 
         if (produce_messages(producer, topics[topic], payloads, keys) <= 0) {
@@ -1399,61 +1485,26 @@ static void *routine_update(void *arg)
 
 static void *remedy(void *arg)
 {
-    char *buf = (char *)arg, *p;
-
-    write_log(app_log_path, LOG_INFO, "thread remedy[%s] created", buf);
+    RemedyArg *ra = (RemedyArg *)arg;
+    write_log(app_log_path, LOG_INFO,
+              "thread remedy[%s] created", ra->fullpath);
 
     int ret = pthread_detach(pthread_self());
     if (ret != 0) {
         write_log(app_log_path, LOG_ERR,
                   "pthread_detach[remedy] failed with errno[%d]", ret);
         write_log(app_log_path, LOG_ERR,
-                  "thread remedy[%s] exiting prematurely", buf);
-        delete buf;
+                  "thread remedy[%s] exiting prematurely", ra->fullpath);
+        delete ra;
         return (void *)-1;
     }
 
-    // XXX
-    // if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
-    if (strncmp(buf, "/data/", sizeof("/data/") - 1) != 0) {
-        write_log(app_log_path, LOG_WARNING,
-                  "invalid log file[%s] for remedy", buf);
-        write_log(app_log_path, LOG_ERR,
-                  "thread remedy[%s] exiting prematurely 2", buf);
-        delete buf;
-        return (void *)-1;
-    }
-
-    if ((p = strrchr(buf, ':')) == NULL) {
-        write_log(app_log_path, LOG_ERR,
-                  "invalid offset record[%s] for remedy", buf);
-        write_log(app_log_path, LOG_ERR,
-                  "thread remedy[%s] exiting prematurely 3", buf);
-        delete buf;
-        return (void *)-1;
-    }
-    *p = '\0';
-
-    long offset = atol(p + 1);
-    char topic[32];
-    size_t l;
-
-    // TODO contents of offset files
-    if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) == 0) {
-        p = strchr(buf + LOG_PATH_ROOT_LEN, '/');
-        l = p - (buf + LOG_PATH_ROOT_LEN);
-        memcpy(topic, buf + LOG_PATH_ROOT_LEN, l);
-        topic[l] = '\0';
-    } else {
-        // XXX temporary treatment
-        memcpy(topic, "consolevisit", sizeof("consolevisit"));
-    }
-
-    int num = produce_msgs_and_save_offset(topics[topic], buf, offset);
+    int num = produce_msgs_and_save_offset(topics[ra->topic],
+                                           ra->fullpath, ra->offset);
 
     write_log(app_log_path, LOG_INFO, "thread remedy[%s][%d] is leaving",
-              buf, num);
-    delete buf;
+              ra->fullpath, num);
+    delete ra;
 
     return (void *)0;
 }
@@ -1471,26 +1522,62 @@ static int check_and_remedy()
     if (stat(offset_archive_path, &st) == 0) {
         if (st.st_size == 0) return 0;
         write_log(app_log_path, LOG_INFO, "remedy-ing unproduced messages");
+
         FILE *fp = fopen(offset_archive_path, "r");
         if (fp == NULL) {
             write_log(app_log_path, LOG_ERR, "fopen[%s] for remedy failed"
                       " with errno[%d]", offset_archive_path, errno);
             return -1;
         }
-        char buf[128];
-        int ret;
+
+        char buf[256], *p;
         while (fgets(buf, sizeof(buf), fp) != NULL) {
+            // XXX
+            // if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) != 0) {
+            if (strncmp(buf, "/data/", sizeof("/data/") - 1) != 0) {
+                write_log(app_log_path, LOG_WARNING,
+                          "invalid log file[%s] for remedy", buf);
+                continue;
+            }
+            if ((p = strrchr(buf, ':')) == NULL) {
+                write_log(app_log_path, LOG_ERR,
+                          "invalid offset record[%s] for remedy", buf);
+                continue;
+            }
+            *p = '\0';
+
+            long offset = atol(p + 1);
+
+            std::map<std::string, FILE *>::iterator it = direct_fps.find(buf);
+            if (it != direct_fps.end()) {
+                if (fseek(it->second, offset, SEEK_SET) != 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "fseek[%s] failed with errno[%d]", buf, errno);
+                }
+                continue;
+            }
+
+            size_t l;
+            RemedyArg *ra = new RemedyArg(offset);
+            strcpy(ra->fullpath, buf);
+
+            // TODO contents of offset files
+            if (strncmp(buf, LOG_PATH_ROOT, LOG_PATH_ROOT_LEN) == 0) {
+                p = strchr(buf + LOG_PATH_ROOT_LEN, '/');
+                l = p - (buf + LOG_PATH_ROOT_LEN);
+                memcpy(ra->topic, buf + LOG_PATH_ROOT_LEN, l);
+                ra->topic[l] = '\0';
+            } else {
+                // XXX temporary treatment
+                memcpy(ra->topic, "consolevisit", sizeof("consolevisit"));
+            }
+
             pthread_t thr;
-            // each line must have been tailed with a '\n'
-            size_t l = strlen(buf);
-            char *s = new char[l];
-            // replace '\n' with '\0'
-            buf[l - 1] = '\0';
-            memcpy(s, buf, l);
-            if ((ret = pthread_create(&thr, NULL, remedy, (void *)s)) != 0) {
-                write_log(app_log_path, LOG_ERR, "pthread_create[remedy] failed"
-                          " with errno[%d]", ret);
-                delete s;
+            int ret = pthread_create(&thr, NULL, remedy, (void *)ra);
+            if (ret != 0) {
+                write_log(app_log_path, LOG_ERR, "pthread_create[remedy]"
+                          " failed with errno[%d]", ret);
+                delete ra;
                 fclose(fp);
                 exit(EXIT_FAILURE);
             }
@@ -1602,6 +1689,9 @@ for (std::multimap<std::string, std::string>::iterator it =
 #endif
 
     init_direct_payloads();
+    if (!init_direct_fp_cache()) {
+        exit(EXIT_FAILURE);
+    }
 
     if ((producer = create_kafka_producer(producer_conf, brokers)) == NULL) {
         write_log(app_log_path, LOG_ERR, "create_kafka_producer to brokers[%s]"
