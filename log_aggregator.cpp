@@ -773,6 +773,8 @@ static void *produce_directly(void *arg)
             // check whether log file was rolled
             if (get_path_from_fp(fp, temp_path, sizeof(temp_path) - 1)
                 && strcmp(fullpath, temp_path) != 0) {
+                write_log(app_log_path, LOG_INFO,
+                          "path[%s:%s] switching", fullpath, temp_path);
                 fclose(fp);
                 if ((fp = fopen(fullpath, "r")) == NULL) {
                     write_log(app_log_path, LOG_ERR,
@@ -1245,11 +1247,13 @@ static void record_backtrace()
 static void clear_up_wd_maps(int inot_fd)
 {
     std::deque<std::string>::iterator conveyor_it;
-    std::vector<std::map<int, std::string>::iterator> its, its2;
+    std::vector<std::map<int, std::string>::iterator> its;
+    std::vector<int> wds;
     int ret;
 
-    for (std::map<int, std::string>::iterator it = wd_path_map.begin(),
-         it2 = wd_topic_map.begin(); it != wd_path_map.end(); it++, it2++) {
+    for (std::map<int, std::string>::iterator it = wd_path_map.begin();
+         it != wd_path_map.end(); it++) {
+        // /data/ef-logs/bid/, only this depth
         if (it->second.find_first_of('/', LOG_PATH_ROOT_LEN + 1)
             == it->second.find_last_of('/')) {
             continue;
@@ -1271,16 +1275,16 @@ static void clear_up_wd_maps(int inot_fd)
                           " with errno[%d]", it->second.c_str(), errno);
             }
             its.push_back(it);
-            its2.push_back(it2);
+            wds.push_back(it->first);
             continue;
         }
         for (conveyor_it = conveyor.begin();
              conveyor_it != conveyor.end(); conveyor_it++) {
             if (conveyor_it->find(it->second) != std::string::npos) break;
         }
-        pthread_mutex_unlock(&conveyor_mtx);
 
         if (conveyor_it == conveyor.end()) {
+            pthread_mutex_unlock(&conveyor_mtx);
             int ret = inotify_rm_watch(inot_fd, it->first);
             if (ret == -1) {
                 write_log(app_log_path, LOG_ERR,
@@ -1288,7 +1292,9 @@ static void clear_up_wd_maps(int inot_fd)
                           "with errno[%d]", it->second.c_str(), errno);
             }
             its.push_back(it);
-            its2.push_back(it2);
+            wds.push_back(it->first);
+        } else {
+            pthread_mutex_unlock(&conveyor_mtx);
         }
     }
 
@@ -1299,12 +1305,9 @@ static void clear_up_wd_maps(int inot_fd)
                   it->first, it->second.c_str());
         wd_path_map.erase(it);
     }
-    for (size_t i = 0, j = its2.size(); i < j; i++) {
-        std::map<int, std::string>::iterator& it = its2[i];
-        write_log(app_log_path, LOG_INFO,
-                  "erasing wd[%d] topic[%s] from wd_topic_map",
-                  it->first, it->second.c_str());
-        wd_topic_map.erase(it);
+    // bad efficiency
+    for (size_t i = 0, j = wds.size(); i < j; i++) {
+        wd_topic_map.erase(wds[i]);
     }
 }
 
@@ -1406,7 +1409,8 @@ static void *zero_update(void *arg)
         // step 3: update wd_path_map & wd_topic_map
         // XXX one of inotify bugs may be triggered in extremely low probability
         pthread_rwlock_wrlock(&watch_lock);
-        clear_up_wd_maps(inot_fd);
+        // XXX
+        //clear_up_wd_maps(inot_fd);
         for (std::multimap<std::string, std::string>::const_iterator it =
              normal_paths.begin(); it != normal_paths.end(); it++) {
             if (it->second.find(today_ymd) == std::string::npos) {
