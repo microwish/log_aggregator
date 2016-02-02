@@ -1337,9 +1337,13 @@ static void clear_up_offset_table()
              conveyor_it != conveyor.end(); conveyor_it++) {
             if (conveyor_it->find(it->first) != std::string::npos) break;
         }
-        pthread_mutex_unlock(&conveyor_mtx);
 
-        if (conveyor_it == conveyor.end()) its.push_back(it);
+        if (conveyor_it == conveyor.end()) {
+            pthread_mutex_unlock(&conveyor_mtx);
+            its.push_back(it);
+        } else {
+            pthread_mutex_unlock(&conveyor_mtx);
+        }
     }
 
     for (size_t i = 0, j = its.size(); i < j; i++) {
