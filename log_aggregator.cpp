@@ -485,6 +485,7 @@ static bool init_direct_fp_cache()
 
 #define BATCH_NUM 100
 #define BATCH_NUM_UNBID 300
+#define BUFSZ 98304 // 98K
 
 static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
                                         char *fullpath,
@@ -517,7 +518,7 @@ static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
     }
 
     int num = 0, batch = BATCH_NUM;
-    char buf[65536], *p = strrchr(fullpath, '/');
+    char buf[BUFSZ], *p = strrchr(fullpath, '/');
     std::vector<std::string> payloads, keys;
     FileOffset fo;
 
