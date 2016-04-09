@@ -485,7 +485,7 @@ static bool init_direct_fp_cache()
 
 #define BATCH_NUM 100
 #define BATCH_NUM_UNBID 300
-#define BUFSZ 98304 // 98K
+#define BUFSZ 98304 // 96K
 
 static int produce_msgs_and_save_offset(kafka_client_topic_t *kct,
                                         char *fullpath,
@@ -727,7 +727,7 @@ static void *produce_directly(void *arg)
     }
 
     std::multimap<std::string, std::string>::iterator it = direct_files.begin();
-    char buf[16384], temp_path[256];
+    char buf[65536], temp_path[256];
     std::map<std::string, FILE *>::iterator it2;
     std::vector<std::string> keys;
     FileOffset fo;
