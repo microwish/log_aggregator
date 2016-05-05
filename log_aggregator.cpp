@@ -284,13 +284,24 @@ static inline bool dir_exists(const char *path)
 static void normalize(const std::string& topic, const std::string& path,
                       std::vector<std::string>& result)
 {
+    size_t pi = path.find('[');
+    if (pi == std::string::npos) {
+        // XXX
+        if ((pi = path.find('{')) == std::string::npos) {
+            write_log(app_log_path, LOG_WARNING,
+                      "invalid raw path[%s] for topic[%s]",
+                      path.c_str(), topic.c_str());
+            return;
+        }
+    }
+
+    std::string pre = path.substr(0, pi);
     // for lately generated date subdirs
-    result.push_back(LOG_PATH_ROOT + topic + '/');
+    result.push_back(pre);
 
     char temp[96];
-    int l = snprintf(temp, sizeof(temp), "%s%s/%s/",
-                     LOG_PATH_ROOT, topic.c_str(), today_ymd.c_str());
-
+    int l = snprintf(temp, sizeof(temp), "%s%s/",
+                     pre.c_str(), today_ymd.c_str());
     // for lately generated hashing subdirs
     result.push_back(temp);
 
@@ -1254,12 +1265,8 @@ static void clear_up_wd_maps(int inot_fd)
 
     for (std::map<int, std::string>::iterator it = wd_path_map.begin();
          it != wd_path_map.end(); it++) {
-        // /data/ef-logs/bid/, only this depth
-        if (it->second.find_first_of('/', LOG_PATH_ROOT_LEN + 1)
-            == it->second.find_last_of('/')) {
-            continue;
-        }
-        if (it->second.find(today_ymd) != std::string::npos) continue;
+        // unworkable if it crosses more than two days
+        if (it->second.find(yesterday_ymd) == std::string::npos) continue;
 
         if ((ret = pthread_mutex_lock(&conveyor_mtx)) != 0) {
             write_log(app_log_path, LOG_WARNING,
@@ -1321,7 +1328,8 @@ static void clear_up_offset_table()
 
     for (std::map<std::string, FileOffset>::iterator it =
          path_offset_table.begin(); it != path_offset_table.end(); it++) {
-        if (it->first.find(today_ymd) != std::string::npos) continue;
+        // unworkable if it crosses more than two days
+        if (it->first.find(yesterday_ymd) == std::string::npos) continue;
 
         if ((ret = pthread_mutex_lock(&conveyor_mtx)) != 0) {
             write_log(app_log_path, LOG_WARNING,
